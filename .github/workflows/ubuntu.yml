@@ -36,6 +36,14 @@ on:
           - repository
         default: explicit
         required: false
+      session_agent:
+        description: Session RCA implementation (candidate is for authorized acceptance only)
+        type: choice
+        options:
+          - release
+          - rust-candidate
+        default: release
+        required: false
 
 env:
   WORKFLOW_ACTION_PUBLIC: "true"
@@ -57,6 +65,7 @@ jobs:
       WORKFLOW_ACTION_CLAIM_URL: ${{ vars.WORKFLOW_ACTION_CLAIM_URL }}
       DURATION_MINUTES: ${{ inputs.duration_mode == 'repository' && (vars.SESSION_DURATION_MINUTES || '300') || inputs.duration_minutes }}
       SESSION_IDLE_MINUTES: ${{ vars.SESSION_IDLE_MINUTES || '30' }}
+      SESSION_RCA_AGENT: ${{ inputs.session_agent || 'release' }}
       SESSION_TAILSCALE_HOSTNAME: ${{ inputs.session_mode == 'fixed' && 'session-ubuntu' || format('sa-{0}-a{1}', github.run_id, github.run_attempt) }}
     steps:
       - name: Capture job lifetime before checkout
@@ -109,10 +118,10 @@ jobs:
         run: bash .github/scripts/ubuntu-ssh.sh
       - name: Signed Ready after private SSH is configured
         run: python3 .github/scripts/session_action.py ready
-      - name: Start optional latest verified Session RCA after signed Ready
+      - name: Start optional reviewed Session RCA after signed Ready
         id: rca_bootstrap
         continue-on-error: true
-        timeout-minutes: 2
+        timeout-minutes: 5
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: python3 .github/scripts/session_rca.py

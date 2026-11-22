@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Optional, SHA-256 verified latest Release Session RCA bootstrap. Never pairs a personal device."""
+"""Optional Session RCA bootstrap: immutable Release by default, pinned Rust source for Ubuntu acceptance."""
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -16,6 +17,9 @@ import zipfile
 from session_action import discover_audience
 
 REPOSITORY = "lirtual/mcp-workers"
+# Advance only with a reviewed Candidate source change and matching Workflow approval.
+CANDIDATE_COMMIT = "2610ebc7093dc7e00f93e75706caff7a4e0487d6"
+CANDIDATE_TIMEOUT_SECONDS = 180
 LIMIT = 180 * 1024 * 1024
 UNPACKED_LIMIT = 250 * 1024 * 1024
 COUNT_LIMIT = 200
@@ -161,6 +165,90 @@ def resolve_latest_release(target, extension, opener=urllib.request.urlopen):
     return tag, digest[7:], url
 
 
+def confirm_linux_registration(process, timeout=45):
+    # Candidate parent exits after one-shot OIDC registration and detached
+    # credential-free transport spawn. A live child still requires Worker evidence.
+    try:
+        exit_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            raise BootstrapError("Linux RCA registration cleanup unconfirmed.") from None
+        raise BootstrapError("Linux RCA registration timed out.") from None
+    if exit_code != 0:
+        raise BootstrapError("Linux RCA registration exited unsuccessfully.")
+    print("Session RCA Linux registration exited successfully; WSS online is not yet confirmed.")
+
+
+def _candidate_build_env(source=os.environ):
+    # Cargo build scripts and git must never inherit the Runner OIDC request
+    # credential, Action tokens, or arbitrary Workflow-provided environment.
+    allowed = ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR",
+               "RUNNER_TEMP", "CARGO_HOME", "RUSTUP_HOME")
+    result = {key: source[key] for key in allowed if source.get(key)}
+    home = result.get("HOME") or str(Path.home())
+    cargo_bin = str(Path(home) / ".cargo" / "bin")
+    result["HOME"] = home
+    result["PATH"] = os.pathsep.join((cargo_bin, source.get("PATH") or os.defpath))
+    return result
+
+
+def build_linux_candidate(runner_temp, *, run=subprocess.run, source_env=os.environ):
+    """Build the exact reviewed Rust Session Candidate without passing OIDC to build tools."""
+    root = Path(runner_temp) / "session-rca-rust-candidate"
+    root.mkdir(mode=0o700, exist_ok=False)
+    source = root / "source"
+    build_env = _candidate_build_env(source_env)
+
+    def execute(args, *, cwd=None, timeout=CANDIDATE_TIMEOUT_SECONDS, capture=False):
+        try:
+            result = run(args, cwd=cwd, env=build_env,
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+        except (OSError, subprocess.SubprocessError):
+            raise BootstrapError("Pinned Rust Candidate build command failed.") from None
+        if result.returncode != 0:
+            raise BootstrapError("Pinned Rust Candidate build command failed.")
+        return result
+
+    repo_url = f"https://github.com/{REPOSITORY}.git"
+    execute(["git", "-c", "credential.helper=", "clone", "--quiet",
+             "--no-checkout", "--no-tags", "--filter=blob:none", repo_url, str(source)])
+    execute(["git", "-c", "credential.helper=", "-C", str(source),
+             "fetch", "--quiet", "--no-tags", "--depth=1", "origin", CANDIDATE_COMMIT])
+    execute(["git", "-C", str(source), "checkout", "--quiet", "--detach", CANDIDATE_COMMIT])
+    revision = execute(["git", "-C", str(source), "rev-parse", "HEAD"], capture=True)
+    if revision.stdout.decode("ascii", "strict").strip() != CANDIDATE_COMMIT:
+        raise BootstrapError("Rust Candidate source pin mismatch.")
+
+    package = source / "apps/remote-control-mcp-worker/agent"
+    rust_project = package / "native-rust"
+    execute(["cargo", "+1.100.0", "build", "--locked", "--bin",
+             "rca-session-linux-candidate"], cwd=rust_project, timeout=CANDIDATE_TIMEOUT_SECONDS)
+    candidate = rust_project / "target/debug/rca-session-linux-candidate"
+    candidate_entry = root / "rca-session-linux-candidate"
+    shutil.copyfile(candidate, candidate_entry)
+    candidate_entry.chmod(0o700)
+
+    supervisor_source = package / "scripts/session-supervisor.c"
+    supervisor = root / "session-supervisor"
+    execute(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+             "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2",
+             "-Wl,-z,relro,-z,now", str(supervisor_source), "-o", str(supervisor)],
+            cwd=package)
+    supervisor.chmod(0o700)
+    if (not candidate_entry.is_file() or candidate_entry.is_symlink()
+            or not supervisor.is_file() or supervisor.is_symlink()):
+        raise BootstrapError("Rust Candidate build output is invalid.")
+    return candidate_entry
+
+
 def confirm_windows_registration(process, timeout=45):
     # Only the OIDC-bearing one-shot parent is observed. Its zero exit means
     # transport spawn was accepted, NOT that WSS connected or remains online.
@@ -258,8 +346,8 @@ def observe_windows_child_stage(runner_temp, delay=time.sleep):
 
 
 def start(env=os.environ, opener=urllib.request.urlopen, launch=subprocess.Popen,
-          select_release=resolve_latest_release):
-    global BOOTSTRAP_PHASE
+          select_release=resolve_latest_release, build_candidate=build_linux_candidate):
+    global BOOTSTRAP_PHASE, BOOTSTRAP_SPAWNED
     BOOTSTRAP_PHASE = "environment"
     windows = sys.platform == "win32"
     workflow = "windows" if windows else "ubuntu"
@@ -271,6 +359,9 @@ def start(env=os.environ, opener=urllib.request.urlopen, launch=subprocess.Popen
     temp = env.get("RUNNER_TEMP", "")
     if not temp or not Path(temp).is_absolute():
         raise BootstrapError("Missing job-scoped runtime directory")
+    agent = env.get("SESSION_RCA_AGENT", "release")
+    if agent not in ("release", "rust-candidate") or (windows and agent != "release"):
+        raise BootstrapError("Unsupported Session RCA implementation selection")
     # Use the already-reviewed Claim discovery contract, not a new repository variable.
     # Override any ambient audience; only the short-lived registration parent receives it.
     BOOTSTRAP_PHASE = "audience"
@@ -300,6 +391,18 @@ def start(env=os.environ, opener=urllib.request.urlopen, launch=subprocess.Popen
                     registration_env["SHELL"] = str(shell)
             except OSError:
                 pass
+    if agent == "rust-candidate":
+        BOOTSTRAP_PHASE = "candidate_build"
+        executable = build_candidate(temp)
+        BOOTSTRAP_PHASE = "candidate_launch"
+        process = launch([str(executable)], cwd=str(executable.parent), env=registration_env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        BOOTSTRAP_SPAWNED = True
+        print(f"Session RCA Rust Candidate launched (pid {process.pid}); Worker online admission remains authoritative.")
+        confirm_linux_registration(process)
+        return True
+
     target = "windows-x64" if windows else "linux-x64-glibc"
     extension = "zip" if windows else "tar.gz"
     BOOTSTRAP_PHASE = "release_lookup"
@@ -327,7 +430,6 @@ def start(env=os.environ, opener=urllib.request.urlopen, launch=subprocess.Popen
     if not node.is_file() or node.is_symlink() or not entry.is_file() or entry.is_symlink():
         raise BootstrapError("Release lacks Session-only foreground executable")
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0
-    global BOOTSTRAP_SPAWNED
     BOOTSTRAP_PHASE = "process_launch"
     process = launch([str(node), str(entry)], cwd=str(stage), env=registration_env,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

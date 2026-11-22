@@ -69,7 +69,8 @@ def settings(root, data):
 
 
 class SessionRcaBootstrapTests(unittest.TestCase):
-    def invoke(self, payload, env_override=None, windows=False, select_override=None):
+    def invoke(self, payload, env_override=None, windows=False, select_override=None,
+               build_candidate=None):
         with tempfile.TemporaryDirectory() as root:
             env = settings(root, payload)
             if windows:
@@ -87,7 +88,8 @@ class SessionRcaBootstrapTests(unittest.TestCase):
                     try:
                         outcome = rca.start(
                             env, opener=lambda *_args, **_kwargs: Download(payload),
-                            launch=launch, select_release=select_override or
+                            launch=launch, build_candidate=build_candidate or rca.build_linux_candidate,
+                            select_release=select_override or
                             (lambda target, extension, opener: (
                                 TAG, hashlib.sha256(payload).hexdigest(),
                                 f"https://github.com/{rca.REPOSITORY}/releases/download/"
@@ -138,6 +140,103 @@ class SessionRcaBootstrapTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(calls[0][1]['env']['WORKFLOW_ACTION_OIDC_AUDIENCE'],
                          'workflow-github-abcde')
+
+    def test_candidate_build_is_sha_pinned_sanitized_and_private(self):
+        with tempfile.TemporaryDirectory() as root:
+            calls = []
+            def fake_run(args, **kwargs):
+                calls.append((args, kwargs))
+                if args[:2] == ["git", "-C"] and "rev-parse" in args:
+                    return type("Result", (), {
+                        "returncode": 0,
+                        "stdout": (rca.CANDIDATE_COMMIT + "\n").encode(),
+                    })()
+                if args[0] == "cargo":
+                    output = Path(kwargs["cwd"]) / "target/debug/rca-session-linux-candidate"
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    output.write_bytes(b"synthetic-rust-binary")
+                if args[0] == "cc":
+                    Path(args[-1]).write_bytes(b"synthetic-supervisor")
+                return type("Result", (), {"returncode": 0, "stdout": b""})()
+
+            candidate = rca.build_linux_candidate(
+                root, run=fake_run,
+                source_env={
+                    "HOME": "/tmp/runner-home", "PATH": "/usr/bin",
+                    "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "must-not-pass",
+                    "GITHUB_TOKEN": "must-not-pass",
+                },
+            )
+            self.assertTrue(candidate.is_file())
+            self.assertEqual(candidate.stat().st_mode & 0o777, 0o700)
+            supervisor = candidate.with_name("session-supervisor")
+            self.assertTrue(supervisor.is_file())
+            self.assertEqual(supervisor.stat().st_mode & 0o777, 0o700)
+            clone = next(args for args, _ in calls if "clone" in args)
+            fetch = next(args for args, _ in calls if "fetch" in args)
+            self.assertIn("credential.helper=", clone)
+            self.assertIn(rca.CANDIDATE_COMMIT, fetch)
+            cargo_call = next(kwargs for args, kwargs in calls if args[0] == "cargo")
+            self.assertNotIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN", cargo_call["env"])
+            self.assertNotIn("GITHUB_TOKEN", cargo_call["env"])
+
+    def test_candidate_build_environment_excludes_runner_credentials(self):
+        safe = rca._candidate_build_env({
+            "HOME": "/tmp/home", "PATH": "/usr/bin", "RUNNER_TEMP": "/tmp",
+            "ACTIONS_ID_TOKEN_REQUEST_URL": "sensitive-url",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "sensitive-token",
+            "WORKFLOW_ACTION_OIDC_AUDIENCE": "sensitive-audience",
+            "GITHUB_TOKEN": "sensitive-github-token",
+            "CLOUDFLARE_API_TOKEN": "sensitive-cloudflare-token",
+        })
+        self.assertEqual(safe["HOME"], "/tmp/home")
+        self.assertNotIn("ACTIONS_ID_TOKEN_REQUEST_URL", safe)
+        self.assertNotIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN", safe)
+        self.assertNotIn("WORKFLOW_ACTION_OIDC_AUDIENCE", safe)
+        self.assertNotIn("GITHUB_TOKEN", safe)
+        self.assertNotIn("CLOUDFLARE_API_TOKEN", safe)
+
+    def test_rust_candidate_mode_launches_only_pinned_linux_binary_without_release_lookup(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as root:
+                env = settings(root, bundle())
+                env["SESSION_RCA_AGENT"] = "rust-candidate"
+                if windows:
+                    env["GITHUB_WORKFLOW"] = "windows"
+                candidate = Path(root) / "rca-session-linux-candidate"
+                candidate.write_bytes(b"synthetic-candidate")
+                launches = []
+                def launch(argv, **kwargs):
+                    launches.append((argv, kwargs))
+                    return type("Child", (), {"pid": 4321, "wait": lambda self, timeout: 0})()
+                with mock.patch.object(rca.sys, "platform", "win32" if windows else "linux"):
+                    try:
+                        result = rca.start(
+                            env, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                                AssertionError("Release must not be fetched in candidate mode")),
+                            launch=launch,
+                            build_candidate=lambda temp: candidate,
+                            select_release=lambda *_args: (_ for _ in ()).throw(
+                                AssertionError("Release selection must not run in candidate mode")),
+                        )
+                    except rca.BootstrapError:
+                        result = "denied"
+                if windows:
+                    self.assertEqual(result, "denied")
+                    self.assertEqual(launches, [])
+                else:
+                    self.assertTrue(result)
+                    self.assertEqual(len(launches), 1)
+                    self.assertEqual(launches[0][0], [str(candidate)])
+                    self.assertTrue(launches[0][1]["start_new_session"])
+                    self.assertEqual(launches[0][1]["env"]["SESSION_ACTION_RCA"], "1")
+                    self.assertIn("ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+                                  launches[0][1]["env"])
+
+    def test_unknown_session_agent_selector_fails_closed(self):
+        result, calls = self.invoke(bundle(), {"SESSION_RCA_AGENT": "node-shell"})
+        self.assertEqual(result, "denied")
+        self.assertEqual(calls, [])
 
     def test_linux_matching_pin_launches_job_private_reviewed_entrypoint(self):
         result, calls = self.invoke(bundle())
