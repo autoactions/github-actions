@@ -72,6 +72,19 @@ class SessionWorkflowInvariants(unittest.TestCase):
                 self.assertIn("inputs.duration_mode == 'repository'", yml)
                 self.assertIn("timeout-minutes: 360", yml)
 
+    def test_rust_session_candidate_is_explicit_ubuntu_only_opt_in(self):
+        ubuntu = (ROOT / ".github/workflows/ubuntu.yml").read_text()
+        self.assertIn("      session_agent:", ubuntu)
+        self.assertIn("          - release\n          - rust-candidate", ubuntu)
+        self.assertIn("        default: release", ubuntu)
+        self.assertIn("        description: Session RCA implementation (candidate is for authorized acceptance only)", ubuntu)
+        self.assertIn("timeout-minutes: 5", ubuntu[ubuntu.index("Start optional reviewed Session RCA"):])
+        self.assertIn("SESSION_RCA_AGENT: ${{ inputs.session_agent || 'release' }}", ubuntu)
+        self.assertIn("CANDIDATE_COMMIT = \"2610ebc7093dc7e00f93e75706caff7a4e0487d6\"",
+                      (ROOT / ".github/scripts/session_rca.py").read_text())
+        windows = (ROOT / ".github/workflows/windows.yml").read_text()
+        self.assertNotIn("session_agent:", windows)
+
     def test_only_ubuntu_reads_repository_idle_minutes(self):
         ubuntu = (ROOT / ".github/workflows/ubuntu.yml").read_text()
         self.assertIn("SESSION_IDLE_MINUTES: ${{ vars.SESSION_IDLE_MINUTES || '30' }}", ubuntu)
